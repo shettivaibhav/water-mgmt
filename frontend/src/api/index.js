@@ -31,6 +31,10 @@ export const getDashboard      = (uid)       => api.get(`/dashboard/${uid}`);
 export const getTimeseries     = (uid, hrs)  => api.get(`/usage-timeseries/${uid}?hours=${hrs}`);
 export const getDailyUsage     = (uid, days) => api.get(`/daily-usage/${uid}?days=${days}`);
 export const getUsageByTap     = (uid, days) => api.get(`/usage-by-tap/${uid}?days=${days}`);
-export const getExportUrl      = (uid, days) => `${BASE}/export-csv/${uid}?days=${days}`;
+export const getHourlyPattern  = (uid, days) => api.get(`/hourly-pattern/${uid}?days=${days}`);
+export const getExportUrl = (uid, days) => {
+  const token = localStorage.getItem("token") || "";
+  return `${BASE}/export-csv/${uid}?days=${days}&token=${token}`;
+};
 
 export default api;

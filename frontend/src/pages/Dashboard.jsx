@@ -59,34 +59,39 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
 
   const loadAll = useCallback(async () => {
-    try {
-      const [d, s, dl, bt] = await Promise.all([
-        getDashboard(uid),
-        getTimeseries(uid, 24),
-        getDailyUsage(uid, 14),
-        getUsageByTap(uid, 7),
-      ]);
-      setDash(d.data);
+    // Fetch each endpoint independently — one failure won't kill the whole dashboard
+    const safe = async (fn) => { try { return await fn(); } catch(e) { console.warn("API error:", e?.message); return null; } };
 
-      // Process timeseries → aggregate by minute bucket
-      const agg = {};
-      s.data.forEach(r => {
-        const k = r.bucket?.substring(11,16) || "00:00";
-        agg[k] = (agg[k]||0) + r.usage_liters;
-      });
-      setSeries(Object.entries(agg).map(([t,v]) => ({ time:t, usage:+v.toFixed(2) })));
+    const [d, s, dl, bt] = await Promise.all([
+      safe(() => getDashboard(uid)),
+      safe(() => getTimeseries(uid, 24)),
+      safe(() => getDailyUsage(uid, 14)),
+      safe(() => getUsageByTap(uid, 7)),
+    ]);
 
-      // daily-usage now returns { date, total_usage, color_status, is_live? }
+    // Dashboard KPIs — only update if we got a valid response
+    if (d?.data) setDash(d.data);
+
+    // Timeseries — backend now returns { bucket_mins, data: [...] }
+    if (s?.data) {
+      const rows = Array.isArray(s.data) ? s.data : (s.data.data || []);
+      setSeries(rows.map(r => ({ time: r.time_bucket, usage: r.total_liters })));
+    }
+
+    // Daily bar chart
+    if (dl?.data) {
       setDaily(dl.data.map(r => ({
-        date:    r.date || r.usage_date,          // handle both field names
-        usage:   +(r.total_usage || 0).toFixed(2),
-        color:   r.color_status,
-        isLive:  r.is_live || false,
+        date:   r.date || r.usage_date || "",
+        usage:  +(r.total_usage || 0).toFixed(2),
+        color:  r.color_status || "green",
+        isLive: r.is_live || false,
       })));
+    }
 
-      setByTap(bt.data);
-    } catch(e) { console.error(e); }
-    finally { setLoading(false); }
+    // Pie chart
+    if (bt?.data) setByTap(bt.data);
+
+    setLoading(false);
   }, [uid]);
 
   useEffect(() => {
@@ -125,7 +130,7 @@ export default function Dashboard() {
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:16, marginBottom:24 }}>
         <StatCard icon="💧" label="Today's Usage"
           value={`${totalUsage.toFixed(1)} L`}
-          sub={`Limit: ${d.orange_limit} L`}
+          sub={d.orange_limit ? `Limit: ${d.orange_limit} L` : "Set limits in System Setup"}
           accent={COLOR_MAP[color]} />
         <StatCard icon="📅" label="Yesterday"
           value={`${(d.yesterday_total||0).toFixed(1)} L`}
@@ -136,21 +141,26 @@ export default function Dashboard() {
           accent={d.change_pct >= 0 ? "#ff9d00" : "#00d97e"} />
         <StatCard icon="🟢" label="Status"
           value={color.toUpperCase()}
-          sub={`Green < ${d.green_limit}L | Orange < ${d.orange_limit}L`}
+          sub={d.green_limit && d.orange_limit
+            ? `Green < ${d.green_limit}L | Orange < ${d.orange_limit}L`
+            : "Configure limits in System Setup"}
           accent={COLOR_MAP[color]} />
       </div>
 
       {/* Tank + tap progress */}
-      <div style={{ display:"grid", gridTemplateColumns:"180px 1fr", gap:16, marginBottom:24 }}>
+      <div style={{ display:"grid", gridTemplateColumns:"240px 1fr", gap:16, marginBottom:24 }}>
         <div style={{
           background:"#0d1220", border:"1px solid #1e2a45",
-          borderRadius:16, padding:24, display:"flex",
-          flexDirection:"column", alignItems:"center", justifyContent:"center", gap:8,
+          borderRadius:16, padding:"24px 16px", display:"flex",
+          flexDirection:"column", alignItems:"center", justifyContent:"center", gap:4,
         }}>
-          <WaterTank pct={pct} color={color} label="Daily Usage" />
-          <div style={{ color:COLOR_MAP[color], fontSize:12, fontWeight:700 }}>
-            {totalUsage.toFixed(1)} / {d.orange_limit} L
-          </div>
+          <WaterTank
+            pct={pct}
+            color={color}
+            label="Daily Usage"
+            total={totalUsage.toFixed(1)}
+            limit={d.orange_limit || "–"}
+          />
         </div>
 
         <div style={{
@@ -175,27 +185,52 @@ export default function Dashboard() {
 
       {/* Charts row 1 */}
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginBottom:24 }}>
-        <ChartCard title="Usage Over Time (24h)" sub="Litres per minute bucket">
-          <ResponsiveContainer width="100%" height={200}>
-            <LineChart data={series}>
+        <ChartCard title="Usage Over Time (24h)" sub={
+          series.length <= 1
+            ? "⏳ Waiting for more simulator ticks — updates every 60s"
+            : `${series.length} data points`
+        }>
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={series} margin={{ top:10, right:20, left:10, bottom:30 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e2a45" />
-              <XAxis dataKey="time" stroke="#4a7fa5" fontSize={10} />
-              <YAxis stroke="#4a7fa5" fontSize={10} />
-              <Tooltip contentStyle={tooltipStyle} />
-              <Line type="monotone" dataKey="usage" stroke="#00d4ff"
-                strokeWidth={2} dot={false} name="Litres" />
+              <XAxis dataKey="time" stroke="#4a7fa5" fontSize={10}
+                interval="preserveStartEnd"
+                label={{ value:"Time (HH:MM)", position:"insideBottom", offset:-16,
+                  fill:"#4a7fa5", fontSize:11 }} />
+              <YAxis stroke="#4a7fa5" fontSize={10}
+                label={{ value:"Litres (L)", angle:-90, position:"insideLeft", offset:10,
+                  fill:"#4a7fa5", fontSize:11 }} />
+              <Tooltip contentStyle={tooltipStyle}
+                itemStyle={tooltipItemStyle}
+                labelStyle={tooltipLabelStyle}
+                formatter={v => [`${v} L`, "Usage"]} />
+              <Line
+                type="monotone" dataKey="usage" stroke="#00d4ff"
+                strokeWidth={2}
+                dot={{ r: 4, fill: "#00d4ff", strokeWidth: 0 }}
+                activeDot={{ r: 6 }}
+                name="Litres"
+                connectNulls
+              />
             </LineChart>
           </ResponsiveContainer>
         </ChartCard>
 
         <ChartCard title="Daily Totals (14 days)" sub="Today's bar shows live running data">
-          <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={daily}>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={daily} margin={{ top:10, right:20, left:10, bottom:30 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#1e2a45" />
               <XAxis dataKey="date" stroke="#4a7fa5" fontSize={9}
-                tickFormatter={d => d?.substring(5)} />
-              <YAxis stroke="#4a7fa5" fontSize={10} />
+                type="category"
+                tickFormatter={d => typeof d === "string" ? d.substring(5) : d}
+                label={{ value:"Date (MM-DD)", position:"insideBottom", offset:-16,
+                  fill:"#4a7fa5", fontSize:11 }} />
+              <YAxis stroke="#4a7fa5" fontSize={10}
+                label={{ value:"Litres (L)", angle:-90, position:"insideLeft", offset:10,
+                  fill:"#4a7fa5", fontSize:11 }} />
               <Tooltip contentStyle={tooltipStyle}
+                itemStyle={tooltipItemStyle}
+                labelStyle={tooltipLabelStyle}
                 formatter={(v, n, props) => [
                   `${v} L${props.payload?.isLive ? " (live)" : ""}`, "Usage"
                 ]} />
@@ -220,23 +255,49 @@ export default function Dashboard() {
         </ChartCard>
       </div>
 
-      {/* Pie chart */}
+      {/* Pie chart — increased height and labelLine to prevent overlap */}
       <ChartCard title="Usage Distribution by Tap (7 days)" sub="Includes today's live usage">
-        <ResponsiveContainer width="100%" height={220}>
-          <PieChart>
-            <Pie data={byTap} dataKey="total_usage" nameKey="tap_name"
-              cx="50%" cy="50%" outerRadius={80} label={({ name, percent }) =>
-                `${name} ${(percent*100).toFixed(1)}%`
-              }>
-              {byTap.map((_, i) => (
-                <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
-              ))}
-            </Pie>
-            <Tooltip contentStyle={tooltipStyle}
-              formatter={(v) => [`${v.toFixed(2)} L`]} />
-            <Legend />
-          </PieChart>
-        </ResponsiveContainer>
+        {byTap.length === 0 || byTap.every(t => !t.total_usage || t.total_usage === 0) ? (
+          <div style={{ textAlign:"center", padding:"40px 0", color:"#4a7fa5" }}>
+            <div style={{ fontSize:32, marginBottom:10 }}>💧</div>
+            <div style={{ fontSize:14, fontWeight:600 }}>No usage data yet</div>
+            <div style={{ fontSize:12, marginTop:6 }}>
+              Turn on taps and let the simulator run to see usage distribution
+            </div>
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height={280}>
+            <PieChart margin={{ top:20, right:80, left:80, bottom:20 }}>
+              <Pie
+                data={byTap} dataKey="total_usage" nameKey="tap_name"
+                cx="50%" cy="50%"
+                innerRadius={55} outerRadius={95}
+                labelLine={{ stroke:"#4a7fa5", strokeWidth:1.5, strokeDasharray:"3 3" }}
+                label={({ name, percent, x, y, midAngle }) => {
+                  const lx = x + (midAngle > 90 && midAngle < 270 ? -8 : 8);
+                  return (
+                    <text x={lx} y={y} fill="#e2e8f0" fontSize={11} fontWeight={600}
+                      textAnchor={midAngle > 90 && midAngle < 270 ? "end" : "start"}
+                      dominantBaseline="central">
+                      {name} {(percent*100).toFixed(1)}%
+                    </text>
+                  );
+                }}
+              >
+                {byTap.map((_, i) => (
+                  <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]}
+                    stroke="#0d1220" strokeWidth={2} />
+                ))}
+              </Pie>
+              <Tooltip contentStyle={tooltipStyle}
+                itemStyle={tooltipItemStyle}
+                labelStyle={tooltipLabelStyle}
+                formatter={(v) => [`${(+v).toFixed(2)} L`, "Usage"]} />
+              <Legend iconType="circle" iconSize={10}
+                wrapperStyle={{ color:"#94a3b8", fontSize:12, paddingTop:8 }} />
+            </PieChart>
+          </ResponsiveContainer>
+        )}
       </ChartCard>
     </div>
   );
@@ -258,6 +319,12 @@ function ChartCard({ title, sub, children }) {
 }
 
 const tooltipStyle = {
-  background:"#0d1220", border:"1px solid #1e2a45",
-  borderRadius:8, color:"#e2e8f0", fontSize:12,
+  background:"#0a0e1a",
+  border:"1px solid #2a3a55",
+  borderRadius:8,
+  color:"#f1f5f9",
+  fontSize:12,
+  fontWeight:600,
 };
+const tooltipItemStyle = { color:"#f1f5f9" };
+const tooltipLabelStyle = { color:"#94a3b8", fontWeight:400, marginBottom:4 };

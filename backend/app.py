@@ -193,23 +193,23 @@ def _reset_running_totals():
 
 def startup_catchup():
     """
-    Runs every time Flask starts.
+    Runs every time Flask starts (BEFORE app.run).
 
-    1. Checks tap_usage_running.last_update — if any tap has data from a
-       PREVIOUS day, it archives that data for the correct past date and
-       resets the running counter to 0 so today starts fresh.
-
-    2. Fills in system_daily_totals for any dates that are in
-       tap_daily_archive but missing from system_daily_totals (e.g. server
-       was off when scheduler tried to run).
+    Handles two scenarios:
+    1. tap_usage_running has data from a previous day (missed midnight archive).
+       → Archives the accumulated total under the LAST ACTIVE date.
+       → Inserts 0-usage records for any fully-missed dates in between.
+       → Resets running totals to 0 so today starts fresh.
+    2. tap_daily_archive has rows but system_daily_totals is missing them.
+       → Backfills system_daily_totals for those dates.
     """
     today = datetime.date.today()
-    print("[STARTUP] Running catchup check…")
+    print(f"[STARTUP] Running catchup check (today = {today})…")
 
-    # ── Step 1: Find stale running totals from previous days ─────────────
+    # ── Step 1: Detect stale running data from previous days ─────────────
     stale_rows = query(
         """
-        SELECT r.tap_id, r.current_usage, DATE(r.last_update) AS usage_date
+        SELECT r.tap_id, r.current_usage, DATE(r.last_update) AS last_date
         FROM   tap_usage_running r
         WHERE  DATE(r.last_update) < %s
           AND  r.current_usage > 0
@@ -218,21 +218,45 @@ def startup_catchup():
     )
 
     if stale_rows:
-        print(f"[STARTUP] Found {len(stale_rows)} tap(s) with un-archived data from previous days.")
+        # Find the date range that was missed
+        last_active_dates = set(r["last_date"] for r in stale_rows)
+        earliest = min(last_active_dates)
+        latest   = max(last_active_dates)
 
-        # Group by date so we archive each past date once
-        dates_to_archive = set(r["usage_date"] for r in stale_rows)
-        for past_date in sorted(dates_to_archive):
-            print(f"[STARTUP] Archiving missed date: {past_date}")
-            _do_archive_for_date(past_date)
+        print(f"[STARTUP] Stale data found — last active: {latest}, today: {today}")
+        print(f"[STARTUP] Will archive accumulated total under {latest}, insert 0s for gap days.")
 
-        # Reset running totals so today starts from 0
+        # Archive accumulated total under the LAST ACTIVE date
+        _do_archive_for_date(latest)
+        print(f"[STARTUP] ✓ Archived usage for {latest}")
+
+        # Insert 0-usage for every fully missed day between latest+1 and today-1
+        gap_start = latest + datetime.timedelta(days=1)
+        gap_end   = today  - datetime.timedelta(days=1)
+        gap_date  = gap_start
+        all_taps  = query("SELECT tap_id, user_id FROM taps")
+
+        while gap_date <= gap_end:
+            print(f"[STARTUP]   Inserting 0-usage for missed date: {gap_date}")
+            for tap in all_taps:
+                existing = query(
+                    "SELECT id FROM tap_daily_archive WHERE tap_id=%s AND archive_date=%s",
+                    (tap["tap_id"], gap_date), fetch="one",
+                )
+                if not existing:
+                    query(
+                        "INSERT INTO tap_daily_archive (tap_id, usage_liters, archive_date) VALUES (%s, 0.0, %s)",
+                        (tap["tap_id"], gap_date), commit=True,
+                    )
+            gap_date += datetime.timedelta(days=1)
+
+        # Reset running totals — today starts from 0
         _reset_running_totals()
-        print("[STARTUP] Running totals reset to 0 for today.")
+        print(f"[STARTUP] Running totals reset. Today ({today}) starts from 0.")
     else:
         print("[STARTUP] No stale running data found.")
 
-    # ── Step 2: Backfill system_daily_totals for any orphaned archive rows ─
+    # ── Step 2: Backfill system_daily_totals for any archive rows missing it ─
     orphaned = query(
         """
         SELECT DISTINCT a.archive_date
@@ -247,12 +271,13 @@ def startup_catchup():
         """,
         (today,),
     )
+
     if orphaned:
         print(f"[STARTUP] Backfilling system_daily_totals for {len(orphaned)} missing date(s).")
+        all_users = query("SELECT DISTINCT user_id FROM taps")
         for row in orphaned:
             d = row["archive_date"]
-            users = query("SELECT DISTINCT user_id FROM taps")
-            for u in users:
+            for u in all_users:
                 uid = u["user_id"]
                 total_row = query(
                     """
@@ -271,7 +296,9 @@ def startup_catchup():
                     )
                 except Exception:
                     limits = None
-                gl, ol = calc_limits(limits or {"people_count":1,"base_green_per_person":100,"base_orange_per_person":200})
+                gl, ol = calc_limits(
+                    limits or {"people_count":1,"base_green_per_person":100,"base_orange_per_person":200}
+                )
                 color = get_color(total, gl, ol)
                 existing = query(
                     "SELECT id FROM system_daily_totals WHERE user_id=%s AND usage_date=%s",
@@ -282,18 +309,12 @@ def startup_catchup():
                         "INSERT INTO system_daily_totals (user_id, total_usage, color_status, usage_date) VALUES (%s,%s,%s,%s)",
                         (uid, total, color, d), commit=True,
                     )
-            print(f"[STARTUP]   ✓ {d}")
+            print(f"[STARTUP]   ✓ system_daily_totals filled for {d}")
     else:
         print("[STARTUP] system_daily_totals is up to date.")
 
     print("[STARTUP] Catchup complete.")
 
-
-with app.app_context():
-    try:
-        startup_catchup()
-    except Exception as e:
-        print(f"[STARTUP] Warning: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # DB helpers
@@ -589,7 +610,7 @@ def dashboard(user_id, current_user_id):
     yesterday    = today - datetime.timedelta(days=1)
 
     # Today's total running usage across all taps
-    today_total = query(
+    today_total = float(query(
         """
         SELECT COALESCE(SUM(r.current_usage), 0) AS total
         FROM   tap_usage_running r
@@ -597,14 +618,27 @@ def dashboard(user_id, current_user_id):
         WHERE  t.user_id = %s
         """,
         (user_id,), fetch="one",
-    )["total"]
+    )["total"] or 0)
 
-    # Yesterday archived total
-    yesterday_total = query(
+    # Yesterday total — try system_daily_totals first, fall back to tap_daily_archive
+    yesterday_row = query(
         "SELECT COALESCE(total_usage, 0) AS total FROM system_daily_totals WHERE user_id=%s AND usage_date=%s",
         (user_id, yesterday), fetch="one",
     )
-    yesterday_total = yesterday_total["total"] if yesterday_total else 0
+    if yesterday_row:
+        yesterday_total = float(yesterday_row["total"] or 0)
+    else:
+        # Fallback: sum from tap_daily_archive directly
+        arch_row = query(
+            """
+            SELECT COALESCE(SUM(a.usage_liters), 0) AS total
+            FROM   tap_daily_archive a
+            JOIN   taps t ON t.tap_id = a.tap_id
+            WHERE  t.user_id = %s AND a.archive_date = %s
+            """,
+            (user_id, yesterday), fetch="one",
+        )
+        yesterday_total = float(arch_row["total"] or 0) if arch_row else 0.0
 
     # Per-tap running usage
     tap_usage = query(
@@ -643,21 +677,43 @@ def dashboard(user_id, current_user_id):
 @token_required
 def usage_timeseries(user_id, current_user_id):
     hours = int(request.args.get("hours", 24))
-    rows  = query(
+
+    # Auto-select bucket size so chart never gets too dense
+    # ≤6h  → 5-min buckets  (max ~72 points)
+    # ≤24h → 15-min buckets (max ~96 points)
+    # ≤48h → 30-min buckets (max ~96 points)
+    # >48h → 60-min buckets (max ~72 points per day)
+    if hours <= 6:
+        bucket_mins = 5
+    elif hours <= 24:
+        bucket_mins = 15
+    elif hours <= 48:
+        bucket_mins = 30
+    else:
+        bucket_mins = 60
+
+    rows = query(
         """
-        SELECT ts.tap_id, t.tap_name,
-               SUM(ts.usage_liters) AS usage_liters,
-               DATE_FORMAT(ts.recorded_at, '%%Y-%%m-%%d %%H:%%i:00') AS bucket
+        SELECT
+            CONCAT(
+                LPAD(HOUR(ts.recorded_at), 2, '0'), ':',
+                LPAD(FLOOR(MINUTE(ts.recorded_at) / %s) * %s, 2, '0')
+            )                              AS time_bucket,
+            ROUND(SUM(ts.usage_liters), 2) AS total_liters,
+            MIN(ts.recorded_at)            AS sort_time
         FROM   tap_usage_timeseries ts
         JOIN   taps t ON t.tap_id = ts.tap_id
         WHERE  t.user_id = %s
           AND  ts.recorded_at >= NOW() - INTERVAL %s HOUR
-        GROUP  BY ts.tap_id, t.tap_name, bucket
-        ORDER  BY bucket ASC
+        GROUP  BY time_bucket
+        ORDER  BY sort_time ASC
         """,
-        (user_id, hours),
+        (bucket_mins, bucket_mins, user_id, hours),
     )
-    return jsonify(rows)
+    return jsonify({
+        "bucket_mins": bucket_mins,
+        "data": [{"time_bucket": r["time_bucket"], "total_liters": float(r["total_liters"] or 0)} for r in rows],
+    })
 
 
 @app.route("/daily-usage/<int:user_id>", methods=["GET"])
@@ -688,7 +744,7 @@ def daily_usage(user_id, current_user_id):
         """,
         (user_id,), fetch="one",
     )
-    today_total = today_row["total"] if today_row else 0
+    today_total = float(today_row["total"]) if today_row else 0.0
 
     try:
         user = query(
@@ -701,14 +757,58 @@ def daily_usage(user_id, current_user_id):
     green_limit, orange_limit = calc_limits(user or {"people_count":1,"base_green_per_person":100,"base_orange_per_person":200})
     today_color = get_color(today_total, green_limit, orange_limit)
 
-    # Merge: archived history + today live
-    result = list(archived) + [{
+    # Merge: archived history + today live — cast dates/decimals to safe JSON types
+    result = [
+        {
+            "date":         str(r["date"]),
+            "total_usage":  round(float(r["total_usage"] or 0), 2),
+            "color_status": r["color_status"],
+            "is_live":      False,
+        }
+        for r in archived
+    ] + [{
         "date":         str(datetime.date.today()),
         "total_usage":  round(today_total, 2),
         "color_status": today_color,
-        "is_live":      True,   # flag so frontend can mark it
+        "is_live":      True,
     }]
 
+    return jsonify(result)
+
+
+@app.route("/hourly-pattern/<int:user_id>", methods=["GET"])
+@token_required
+def hourly_pattern(user_id, current_user_id):
+    """Average usage per hour-of-day across last N days — used for the heatmap."""
+    days = int(request.args.get("days", 30))
+    rows = query(
+        """
+        SELECT
+            HOUR(ts.recorded_at)           AS hour_of_day,
+            ROUND(SUM(ts.usage_liters), 2) AS total_liters,
+            COUNT(DISTINCT DATE(ts.recorded_at)) AS active_days
+        FROM   tap_usage_timeseries ts
+        JOIN   taps t ON t.tap_id = ts.tap_id
+        WHERE  t.user_id = %s
+          AND  ts.recorded_at >= NOW() - INTERVAL %s DAY
+        GROUP  BY hour_of_day
+        ORDER  BY hour_of_day ASC
+        """,
+        (user_id, days),
+    )
+    hour_map = {r["hour_of_day"]: r for r in rows}
+    result = []
+    for h in range(24):
+        r       = hour_map.get(h, {"hour_of_day": h, "total_liters": 0, "active_days": 1})
+        total   = float(r["total_liters"] or 0)
+        days_ct = int(r["active_days"] or 1)
+        avg     = round(total / max(days_ct, 1), 2)
+        result.append({
+            "hour":         h,
+            "label":        f"{h:02d}:00",
+            "total_liters": round(total, 2),
+            "avg_liters":   avg,
+        })
     return jsonify(result)
 
 
@@ -745,10 +845,12 @@ def usage_by_tap(user_id, current_user_id):
     )
     live_map = {row["tap_id"]: row["live_usage"] for row in live}
 
-    # Combine: archived + today's live
+    # Combine: archived + today's live — cast to float (MySQL SUM returns Decimal)
     result = []
     for row in archived:
-        total = round((row["archived_usage"] or 0) + (live_map.get(row["tap_id"], 0) or 0), 2)
+        archived_val = float(row["archived_usage"] or 0)
+        live_val     = float(live_map.get(row["tap_id"], 0) or 0)
+        total        = round(archived_val + live_val, 2)
         result.append({
             "tap_name":    row["tap_name"],
             "location":    row["location"],
@@ -760,15 +862,27 @@ def usage_by_tap(user_id, current_user_id):
 
 
 @app.route("/export-csv/<int:user_id>", methods=["GET"])
-@token_required
-def export_csv(user_id, current_user_id):
+def export_csv(user_id):
     import io, csv
     from flask import Response
 
+    # Accept token via query param (browser downloads can't set headers)
+    token = request.args.get("token") or request.headers.get("Authorization","").replace("Bearer ","")
+    if not token:
+        return jsonify({"error": "Token missing"}), 401
+    try:
+        jwt.decode(token, Config.JWT_SECRET_KEY, algorithms=["HS256"])
+    except Exception:
+        return jsonify({"error": "Invalid or expired token"}), 401
+
     days = int(request.args.get("days", 30))
+
+    # Archived historical rows
     rows = query(
         """
-        SELECT a.archive_date, t.tap_name, t.location, a.usage_liters
+        SELECT CAST(a.archive_date AS CHAR) AS archive_date,
+               t.tap_name, t.location,
+               ROUND(a.usage_liters, 3) AS usage_liters
         FROM   tap_daily_archive a
         JOIN   taps t ON t.tap_id = a.tap_id
         WHERE  t.user_id = %s
@@ -778,15 +892,38 @@ def export_csv(user_id, current_user_id):
         (user_id, days),
     )
 
+    # Today's live running rows (not yet archived)
+    live_rows = query(
+        """
+        SELECT t.tap_name, t.location,
+               ROUND(COALESCE(r.current_usage, 0), 3) AS usage_liters
+        FROM   taps t
+        LEFT JOIN tap_usage_running r ON r.tap_id = t.tap_id
+        WHERE  t.user_id = %s
+        ORDER  BY t.tap_name
+        """,
+        (user_id,),
+    )
+    today_str = str(datetime.date.today())
+    live_csv  = [{"archive_date": today_str + " (live)",
+                  "tap_name": r["tap_name"],
+                  "location": r["location"],
+                  "usage_liters": float(r["usage_liters"] or 0)} for r in live_rows]
+
+    all_rows = live_csv + [dict(r) for r in rows]
+
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["archive_date","tap_name","location","usage_liters"])
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows(all_rows)
 
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=water_usage.csv"},
+        headers={
+            "Content-Disposition": f"attachment; filename=aquatrack_usage_{today_str}.csv",
+            "Access-Control-Allow-Origin": "*",
+        },
     )
 
 # ─────────────────────────────────────────────────────────────
@@ -900,18 +1037,15 @@ def catchup_archive():
 
 
 if __name__ == "__main__":
+    # ── Run startup tasks BEFORE blocking app.run() ──────────────
+    with app.app_context():
+        try:
+            run_migrations()
+        except Exception as e:
+            print(f"[MIGRATION] Warning: {e}")
+        try:
+            startup_catchup()
+        except Exception as e:
+            print(f"[STARTUP] Warning: {e}")
+
     app.run(debug=True, port=5000)
-
-# ─────────────────────────────────────────────────────────────
-# STARTUP — runs after ALL functions/routes are defined
-# ─────────────────────────────────────────────────────────────
-with app.app_context():
-    try:
-        run_migrations()
-    except Exception as e:
-        print(f"[MIGRATION] Warning: {e}")
-
-    try:
-        startup_catchup()
-    except Exception as e:
-        print(f"[STARTUP] Warning: {e}")

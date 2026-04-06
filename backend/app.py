@@ -811,6 +811,32 @@ def hourly_pattern(user_id, current_user_id):
         })
     return jsonify(result)
 
+@app.route("/today-hourly/<int:user_id>", methods=["GET"])
+@token_required
+def today_hourly(user_id, current_user_id):
+    """Hourly usage breakdown for TODAY only — used for the 24h scrollable line chart."""
+    rows = query(
+        """
+        SELECT
+            HOUR(ts.recorded_at)           AS hour_num,
+            ROUND(SUM(ts.usage_liters), 2) AS total_liters
+        FROM   tap_usage_timeseries ts
+        JOIN   taps t ON t.tap_id = ts.tap_id
+        WHERE  t.user_id = %s
+          AND  DATE(ts.recorded_at) = CURDATE()
+        GROUP  BY hour_num
+        ORDER  BY hour_num ASC
+        """,
+        (user_id,),
+    )
+    hour_map = {r["hour_num"]: float(r["total_liters"] or 0) for r in rows}
+    result = [
+        { "hour": h, "label": f"{h:02d}:00", "liters": hour_map.get(h, 0) }
+        for h in range(24)
+    ]
+    return jsonify(result)
+
+
 
 @app.route("/usage-by-tap/<int:user_id>", methods=["GET"])
 @token_required
@@ -958,37 +984,90 @@ def simulate_usage():
         _reset_running_totals()
         print(f"[SIMULATE] Reset complete. Today ({today}) starts from 0.")
 
-    # ── Normal simulation ─────────────────────────────────────────────────
-    on_taps = query("SELECT tap_id FROM taps WHERE tap_status='ON'")
+    # ── Normal simulation with AI speed throttle ─────────────────────────
+    on_taps = query(
+        """
+        SELECT t.tap_id, t.user_id
+        FROM   taps t
+        WHERE  t.tap_status='ON'
+        """
+    )
 
     if not on_taps:
-        return jsonify({"message": "Simulated 0 tap(s) — no taps are ON", "taps_on": 0})
+        return jsonify({"message": "Simulated 0 tap(s) — no taps are ON",
+                        "taps_on": 0, "speed_mode": "normal"})
 
+    # Per-user: check if today_total has crossed green_limit → throttle flow
+    user_totals = {}
+    user_limits = {}
+    for row in on_taps:
+        uid = row["user_id"]
+        if uid not in user_totals:
+            tot = query(
+                """SELECT COALESCE(SUM(r.current_usage),0) AS total
+                   FROM tap_usage_running r JOIN taps t ON t.tap_id=r.tap_id
+                   WHERE t.user_id=%s""",
+                (uid,), fetch="one",
+            )
+            user_totals[uid] = float(tot["total"] or 0)
+            try:
+                ul = query(
+                    "SELECT people_count, base_green_per_person, base_orange_per_person FROM users WHERE user_id=%s",
+                    (uid,), fetch="one",
+                )
+                user_limits[uid] = calc_limits(ul or {})
+            except Exception:
+                user_limits[uid] = (100.0, 200.0)
+
+    ticked   = 0
+    throttled = 0
     for row in on_taps:
         tap_id = row["tap_id"]
-        amount = round(random.uniform(Config.SIMULATE_MIN_LITERS, Config.SIMULATE_MAX_LITERS), 3)
+        uid    = row["user_id"]
+
+        green_lim, _ = user_limits.get(uid, (100.0, 200.0))
+        today_total  = user_totals.get(uid, 0)
+
+        # AI throttle: if usage exceeded green_limit, reduce flow to 30% of normal
+        if today_total >= green_lim:
+            amount = round(random.uniform(
+                Config.SIMULATE_MIN_LITERS * 0.3,
+                Config.SIMULATE_MAX_LITERS * 0.3,
+            ), 3)
+            throttled += 1
+        else:
+            amount = round(random.uniform(
+                Config.SIMULATE_MIN_LITERS,
+                Config.SIMULATE_MAX_LITERS,
+            ), 3)
+        ticked += 1
 
         query(
             "INSERT INTO tap_usage_timeseries (tap_id, usage_liters) VALUES (%s, %s)",
             (tap_id, amount), commit=True,
         )
-
         existing = query(
             "SELECT tap_id FROM tap_usage_running WHERE tap_id=%s",
             (tap_id,), fetch="one",
         )
         if existing:
             query(
-                "UPDATE tap_usage_running SET current_usage = current_usage + %s, last_update = NOW() WHERE tap_id = %s",
+                "UPDATE tap_usage_running SET current_usage=current_usage+%s, last_update=NOW() WHERE tap_id=%s",
                 (amount, tap_id), commit=True,
             )
         else:
             query(
-                "INSERT INTO tap_usage_running (tap_id, current_usage) VALUES (%s, %s)",
+                "INSERT INTO tap_usage_running (tap_id, current_usage) VALUES (%s,%s)",
                 (tap_id, amount), commit=True,
             )
 
-    return jsonify({"message": f"Simulated {len(on_taps)} tap(s)", "taps_on": len(on_taps)})
+    speed_mode = "throttled" if throttled > 0 else "normal"
+    return jsonify({
+        "message":     f"Simulated {ticked} tap(s)",
+        "taps_on":     ticked,
+        "speed_mode":  speed_mode,
+        "throttled":   throttled,
+    })
 
 # ─────────────────────────────────────────────────────────────
 # ARCHIVE DAILY DATA (midnight scheduler)
@@ -1001,6 +1080,37 @@ def archive_daily_data():
     _do_archive_for_date(archive_date)
     _reset_running_totals()
     return jsonify({"message": "Archive complete", "date": str(archive_date)})
+
+
+@app.route("/flow-status/<int:user_id>", methods=["GET"])
+@token_required
+def flow_status(user_id, current_user_id):
+    """Returns whether the AI throttle is active for this user."""
+    try:
+        tot = query(
+            """SELECT COALESCE(SUM(r.current_usage),0) AS total
+               FROM tap_usage_running r JOIN taps t ON t.tap_id=r.tap_id
+               WHERE t.user_id=%s""",
+            (user_id,), fetch="one",
+        )
+        today_total = float(tot["total"] or 0)
+        ul = query(
+            "SELECT people_count, base_green_per_person, base_orange_per_person FROM users WHERE user_id=%s",
+            (user_id,), fetch="one",
+        )
+        green_lim, orange_lim = calc_limits(ul or {})
+        throttled = today_total >= green_lim
+        return jsonify({
+            "today_total":  round(today_total, 2),
+            "green_limit":  green_lim,
+            "orange_limit": orange_lim,
+            "throttled":    throttled,
+            "speed_mode":   "throttled (30%)" if throttled else "normal (100%)",
+            "message":      "⚠️ AI throttle active — flow reduced to 30% (green limit exceeded)" if throttled
+                            else "✅ Normal flow — within green limit",
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ─────────────────────────────────────────────────────────────

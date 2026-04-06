@@ -26,6 +26,9 @@ export const deleteTap  = (id)        => api.delete(`/delete-tap/${id}`);
 export const tapOn      = (id)        => api.post(`/tap-on/${id}`);
 export const tapOff     = (id)        => api.post(`/tap-off/${id}`);
 
+// Flow status (AI throttle)
+export const getFlowStatus = (uid)    => api.get(`/flow-status/${uid}`);
+
 // Dashboard & analytics
 export const getDashboard      = (uid)       => api.get(`/dashboard/${uid}`);
 export const getTimeseries     = (uid, hrs)  => api.get(`/usage-timeseries/${uid}?hours=${hrs}`);
